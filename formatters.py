@@ -28,7 +28,8 @@ def welcome_text() -> str:
         "(libraryofbabel.info) и показываю, где именно они нашлись.\n\n"
         "Просто отправьте текст сообщением или командой /find &lt;текст&gt;.\n"
         "Библиотека знает только строчные латинские буквы a–z, пробел, запятую и точку. "
-        "Заглавные я переведу в строчные сам, а русский текст могу транслитерировать.\n\n"
+        "Заглавные я переведу в строчные сам, а русский текст переведу на английский "
+        "(или транслитерирую, если попросите).\n\n"
         "Правила и примеры: /help"
     )
 
@@ -42,10 +43,16 @@ def help_text() -> str:
         "• приведу текст к нижнему регистру;\n"
         "• схлопну лишние пробелы и переводы строк;\n"
         "• если останутся неподдерживаемые символы (цифры, знаки, кириллица), скажу, какие именно, "
-        "и предложу транслитерацию русского текста.\n\n"
+        "и предложу перевести русский текст на английский или транслитерировать его.\n\n"
+        "<b>Перевод на английский</b>\n"
+        "Русский текст можно перевести командой <code>/translate привет, мир</code> "
+        "или кнопкой «Перевести на английский и искать» под сообщением о неподдерживаемых символах. "
+        "Это именно перевод («привет» → <code>hello</code>), а не транслитерация «privet», "
+        "поэтому в библиотеке ищутся настоящие английские слова.\n\n"
         "<b>Примеры</b>\n"
         "<code>hello world</code>\n"
         "<code>/find the library is infinite.</code>\n"
+        "<code>/translate привет, мир</code>\n"
         "<code>privet, mir</code>\n\n"
         "<b>Режимы</b>\n"
         "• <i>точное совпадение</i>: страница, на которой ваш текст стоит как есть;\n"
@@ -73,7 +80,10 @@ def unsupported_message(chars: Iterable[str], cyrillic: bool) -> str:
         "Доступны только a–z, пробел, запятая и точка."
     )
     if cyrillic:
-        text += "\n\nМогу транслитерировать русский текст в латиницу и искать его."
+        text += (
+            "\n\nМогу перевести русский текст на английский и искать уже английские слова "
+            "или транслитерировать его в латиницу."
+        )
     return text
 
 
@@ -82,6 +92,53 @@ def after_translit_unsupported_message(chars: Iterable[str], translit: str) -> s
     return (
         "После транслитерации остались неподдерживаемые символы: " + shown + ".\n"
         "Уберите их или замените (например, цифры словами) и отправьте запрос заново."
+    )
+
+
+def translate_usage() -> str:
+    return (
+        "Отправьте русский текст для перевода на английский, например:\n"
+        "<code>/translate привет, мир</code>\n"
+        "Полученный перевод можно сразу искать в библиотеке."
+    )
+
+
+def translate_needs_russian() -> str:
+    return (
+        "В тексте нет русских букв — он уже на латинице. "
+        "Отправьте его как обычный запрос для поиска."
+    )
+
+
+def translate_too_long(length: int) -> str:
+    return (
+        f"Текст для перевода слишком длинный: {length} симв. "
+        f"Лимит библиотеки: {MAX_LENGTH}. Сократите текст и отправьте снова."
+    )
+
+
+def translation_failed() -> str:
+    return (
+        "Не удалось перевести текст: сервисы перевода сейчас недоступны. "
+        "Попробуйте позже."
+    )
+
+
+def translation_text(source: str, translated: str, provider: str) -> str:
+    src = source if len(source) <= QUERY_PREVIEW_LEN else source[:QUERY_PREVIEW_LEN] + "…"
+    out = translated if len(translated) <= 3000 else translated[:3000] + "…"
+    return (
+        f"🌐 <b>Перевод на английский</b> ({_h(provider)})\n"
+        f"<code>{_h(out)}</code>\n\n"
+        f"🇷🇺 Было: {_h(src)}"
+    )
+
+
+def translation_warning(chars: Iterable[str]) -> str:
+    shown = ", ".join(f"«{_h(c)}»" for c in list(chars)[:20])
+    return (
+        "⚠️ В переводе есть символы, которых нет в библиотеке: " + shown + ". "
+        "Поэтому искать его нельзя — замените цифры и знаки словами."
     )
 
 
@@ -138,12 +195,20 @@ def _short_hex(hexagon: str, keep: int = 24) -> str:
     return f"{hexagon[:keep]}…{hexagon[-keep:]} ({len(hexagon)} симв.)"
 
 
-def format_result(result: SearchResult) -> str:
+def format_result(result: SearchResult, translated_from: Optional[str] = None) -> str:
     loc = result.location
     q = result.query
     q_shown = q if len(q) <= QUERY_PREVIEW_LEN else q[:QUERY_PREVIEW_LEN] + "…"
     page_text = result.page_text.rstrip() if result.mode == MODE_EXACT else result.page_text
     snippet = make_snippet(page_text, result.match_start, len(result.query))
+    translated_note = ""
+    if translated_from:
+        src = (
+            translated_from
+            if len(translated_from) <= QUERY_PREVIEW_LEN
+            else translated_from[:QUERY_PREVIEW_LEN] + "…"
+        )
+        translated_note = f"\n🌐 Переведено с русского: {_h(src)}"
     note = ""
     if result.match_start is None:
         note = "\n<i>Точное место текста на странице определить не удалось, показано начало страницы.</i>"
@@ -164,7 +229,7 @@ def format_result(result: SearchResult) -> str:
 
     text = (
         f"🔎 Запрос: {_h(q_shown)}\n"
-        f"Режим: {MODE_TITLES.get(result.mode, result.mode)}\n\n"
+        f"Режим: {MODE_TITLES.get(result.mode, result.mode)}{translated_note}\n\n"
         "📍 Расположение:\n"
         f"Гексагон: {_h(_short_hex(loc.hexagon))}\n"
         f"Стена: {_h(loc.wall)}\n"
@@ -192,7 +257,25 @@ def result_keyboard(url: Optional[str], token: str, mode: str) -> InlineKeyboard
     return InlineKeyboardMarkup(rows)
 
 
-def translit_keyboard(token: str) -> InlineKeyboardMarkup:
+def cyrillic_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Кнопки для русского текста: перевод (основной путь) и транслитерация."""
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Транслитерировать и искать", callback_data=f"tr:{token}")]]
+        [
+            [InlineKeyboardButton("🌐 Перевести на английский и искать", callback_data=f"tl:{token}")],
+            [InlineKeyboardButton("🔤 Транслитерировать и искать", callback_data=f"tr:{token}")],
+        ]
+    )
+
+
+def translit_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Запасная кнопка, если перевод не удался."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔤 Транслитерировать и искать", callback_data=f"tr:{token}")]]
+    )
+
+
+def translation_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Кнопка «искать уже переведённый текст»."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔎 Искать перевод в библиотеке", callback_data=f"q:{token}")]]
     )

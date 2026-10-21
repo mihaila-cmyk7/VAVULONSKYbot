@@ -28,6 +28,7 @@ from telegram.ext import (
 
 import formatters as fmt
 import page_image
+import translator
 import validators
 from babel_client import (
     MODE_ANY,
@@ -44,6 +45,7 @@ log = logging.getLogger("babel-bot")
 DEFAULT_MODE = MODE_EXACT
 RATE_LIMIT_SECONDS = 3.0
 MAX_PARALLEL_SEARCHES = 3
+MAX_PARALLEL_TRANSLATIONS = 4
 
 
 # --------------------------------------------------------------- инфраструктура
@@ -134,6 +136,8 @@ async def post_init(app: Application) -> None:
     app.bot_data["tokens"] = TokenStore()
     app.bot_data["limiter"] = RateLimiter(RATE_LIMIT_SECONDS)
     app.bot_data["sem"] = asyncio.Semaphore(MAX_PARALLEL_SEARCHES)
+    app.bot_data["translator"] = translator.Translator()
+    app.bot_data["translate_sem"] = asyncio.Semaphore(MAX_PARALLEL_TRANSLATIONS)
 
     # На Render Web Service нужно слушать порт из переменной PORT, иначе деплой не завершится.
     port = os.getenv("PORT")
@@ -156,6 +160,9 @@ async def post_shutdown(app: Application) -> None:
     client: BabelClient = app.bot_data.get("client")
     if client:
         await client.aclose()
+    translator_client: Optional[translator.Translator] = app.bot_data.get("translator")
+    if translator_client:
+        await translator_client.aclose()
 
 
 # Если задать переменную окружения DEBUG_ERRORS=1, бот допишет причину ошибки прямо в чат.
@@ -174,7 +181,11 @@ def _debug_html(exc: object) -> str:
 
 # ------------------------------------------------------------------ ядро поиска
 async def do_search(
-    context: ContextTypes.DEFAULT_TYPE, query: str, mode: str, use_cache: bool = True
+    context: ContextTypes.DEFAULT_TYPE,
+    query: str,
+    mode: str,
+    use_cache: bool = True,
+    translated_from: Optional[str] = None,
 ) -> tuple[str, Optional[InlineKeyboardMarkup], Optional[SearchResult]]:
     """Выполняет поиск и возвращает (html-текст, клавиатура, результат). Ошибки превращает в сообщения."""
     bd = context.application.bot_data
@@ -194,8 +205,15 @@ async def do_search(
         log.exception("Неожиданная ошибка поиска")
         return fmt.generic_error() + _debug_html(exc), None, None
 
-    token = bd["tokens"].put({"query": query, "mode": mode})
-    return fmt.format_result(result), fmt.result_keyboard(result.url, token, mode), result
+    payload = {"query": query, "mode": mode}
+    if translated_from:
+        payload["translated_from"] = translated_from
+    token = bd["tokens"].put(payload)
+    return (
+        fmt.format_result(result, translated_from),
+        fmt.result_keyboard(result.url, token, mode),
+        result,
+    )
 
 
 async def _safe_edit(edit_coro) -> None:
@@ -231,6 +249,77 @@ async def send_screenshot(message, result: Optional[SearchResult]) -> None:
         log.exception("Не удалось отправить скриншот страницы")
 
 
+async def translate_raw(
+    context: ContextTypes.DEFAULT_TYPE, raw: str
+) -> tuple[Optional[translator.Translation], str]:
+    """Переводит русский текст. Возвращает (перевод, "") либо (None, текст ошибки)."""
+    try:
+        async with context.application.bot_data["translate_sem"]:
+            result = await context.application.bot_data["translator"].translate(raw)
+        return result, ""
+    except translator.TranslationError as exc:
+        log.warning("Перевод не удался: %s", exc)
+        return None, fmt.translation_failed() + _debug_html(exc)
+    except Exception as exc:
+        log.exception("Неожиданная ошибка перевода")
+        return None, fmt.translation_failed() + _debug_html(exc)
+
+
+def _searchable(translation: translator.Translation) -> validators.Validation:
+    """Приводит перевод к виду, который принимает библиотека (пунктуация, регистр)."""
+    return validators.validate(validators.sanitize_for_library(translation.text))
+
+
+async def _translate_and_search(q, context: ContextTypes.DEFAULT_TYPE, raw: str, token: str) -> None:
+    """Кнопка «Перевести на английский и искать»."""
+    if len(raw) > translator.MAX_INPUT:
+        await _safe_edit(q.edit_message_text(fmt.translate_too_long(len(raw))))
+        return
+    await _safe_edit(q.edit_message_text("🌐 Перевожу…"))
+    translation, error = await translate_raw(context, raw)
+    if translation is None:
+        await _safe_edit(
+            q.edit_message_text(
+                error, parse_mode=ParseMode.HTML, reply_markup=fmt.translit_keyboard(token)
+            )
+        )
+        return
+
+    v = _searchable(translation)
+    if not v.text:
+        await _safe_edit(
+            q.edit_message_text(
+                fmt.translation_failed(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=fmt.translit_keyboard(token),
+            )
+        )
+        return
+    if v.too_long:
+        await _safe_edit(q.edit_message_text(fmt.translate_too_long(len(translation.text))))
+        return
+    if v.unsupported:
+        await _safe_edit(
+            q.edit_message_text(
+                fmt.translation_text(raw, translation.text, translation.provider_title)
+                + "\n\n"
+                + fmt.translation_warning(v.unsupported),
+                parse_mode=ParseMode.HTML,
+                reply_markup=fmt.translit_keyboard(token),
+            )
+        )
+        return
+
+    await _safe_edit(q.edit_message_text("🔎 Ищу…"))
+    text, kb, result = await do_search(context, v.text, DEFAULT_MODE, translated_from=raw)
+    await _safe_edit(
+        q.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
+        )
+    )
+    await send_screenshot(q.message, result)
+
+
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str) -> None:
     msg = update.effective_message
     user = update.effective_user
@@ -249,7 +338,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_t
         kb = None
         if cyr:
             token = context.application.bot_data["tokens"].put({"raw": v.text})
-            kb = fmt.translit_keyboard(token)
+            kb = fmt.cyrillic_keyboard(token)
         await msg.reply_text(
             fmt.unsupported_message(v.unsupported, cyr), parse_mode=ParseMode.HTML, reply_markup=kb
         )
@@ -283,6 +372,53 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_query(update, context, " ".join(context.args or []))
 
 
+async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Переводит русский текст на английский, не трогая и не искажая слова."""
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await msg.reply_text(fmt.translate_usage(), parse_mode=ParseMode.HTML)
+        return
+    if len(raw) > translator.MAX_INPUT:
+        await msg.reply_text(fmt.translate_too_long(len(raw)))
+        return
+    if not validators.has_cyrillic(raw):
+        await msg.reply_text(fmt.translate_needs_russian(), parse_mode=ParseMode.HTML)
+        return
+
+    wait = context.application.bot_data["limiter"].check(user.id)
+    if wait:
+        await msg.reply_text(fmt.rate_limited(wait))
+        return
+
+    status = await msg.reply_text("🌐 Перевожу…")
+    translation, error = await translate_raw(context, raw)
+    if translation is None:
+        await _safe_edit(status.edit_text(error, parse_mode=ParseMode.HTML))
+        return
+
+    v = _searchable(translation)
+    text = fmt.translation_text(raw, translation.text, translation.provider_title)
+    kb = None
+    if v.ok:
+        token = context.application.bot_data["tokens"].put(
+            {"query": v.text, "mode": DEFAULT_MODE, "translated_from": raw}
+        )
+        kb = fmt.translation_keyboard(token)
+    elif v.too_long:
+        text += "\n\n" + fmt.translate_too_long(len(translation.text))
+    elif v.unsupported:
+        text += "\n\n" + fmt.translation_warning(v.unsupported)
+    await _safe_edit(
+        status.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
+        )
+    )
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message and update.effective_message.text:
         await handle_query(update, context, update.effective_message.text)
@@ -307,6 +443,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     await q.answer()
 
+    if action == "tl":
+        await _translate_and_search(q, context, str(payload.get("raw", "")), parts[1])
+        return
+
+    translated_from = payload.get("translated_from")
     if action == "tr":
         translit = validators.transliterate(payload["raw"])
         v = validators.validate(translit)
@@ -329,11 +470,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         query, mode, use_cache = payload["query"], parts[2], True
     elif action == "r":
         query, mode, use_cache = payload["query"], payload["mode"], False
+    elif action == "q":
+        query, mode, use_cache = payload["query"], payload["mode"], True
     else:
         return
 
     await _safe_edit(q.edit_message_text("🔎 Ищу…"))
-    text, kb, result = await do_search(context, query, mode, use_cache=use_cache)
+    text, kb, result = await do_search(
+        context, query, mode, use_cache=use_cache, translated_from=translated_from
+    )
     await _safe_edit(
         q.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
@@ -371,6 +516,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("find", cmd_find))
+    app.add_handler(CommandHandler("translate", cmd_translate))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
