@@ -27,6 +27,7 @@ from telegram.ext import (
 )
 
 import formatters as fmt
+import page_image
 import validators
 from babel_client import (
     MODE_ANY,
@@ -35,6 +36,7 @@ from babel_client import (
     BabelError,
     BabelParseError,
     BabelUnavailable,
+    SearchResult,
 )
 
 log = logging.getLogger("babel-bot")
@@ -173,27 +175,27 @@ def _debug_html(exc: object) -> str:
 # ------------------------------------------------------------------ ядро поиска
 async def do_search(
     context: ContextTypes.DEFAULT_TYPE, query: str, mode: str, use_cache: bool = True
-) -> tuple[str, Optional[InlineKeyboardMarkup]]:
-    """Выполняет поиск и возвращает (html-текст, клавиатура). Ошибки превращает в сообщения."""
+) -> tuple[str, Optional[InlineKeyboardMarkup], Optional[SearchResult]]:
+    """Выполняет поиск и возвращает (html-текст, клавиатура, результат). Ошибки превращает в сообщения."""
     bd = context.application.bot_data
     try:
         async with bd["sem"]:
             result = await bd["client"].search(query, mode, use_cache=use_cache)
     except BabelUnavailable as exc:
         log.exception("Сайт недоступен")
-        return fmt.site_unavailable() + _debug_html(exc), None
+        return fmt.site_unavailable() + _debug_html(exc), None, None
     except BabelParseError as exc:
         log.exception("Не удалось разобрать ответ сайта (запрос=%r, режим=%s)", query[:80], mode)
-        return fmt.parse_error() + _debug_html(exc), None
+        return fmt.parse_error() + _debug_html(exc), None, None
     except BabelError as exc:
         log.exception("Ошибка клиента")
-        return fmt.generic_error() + _debug_html(exc), None
+        return fmt.generic_error() + _debug_html(exc), None, None
     except Exception as exc:
         log.exception("Неожиданная ошибка поиска")
-        return fmt.generic_error() + _debug_html(exc), None
+        return fmt.generic_error() + _debug_html(exc), None, None
 
     token = bd["tokens"].put({"query": query, "mode": mode})
-    return fmt.format_result(result), fmt.result_keyboard(result.url, token, mode)
+    return fmt.format_result(result), fmt.result_keyboard(result.url, token, mode), result
 
 
 async def _safe_edit(edit_coro) -> None:
@@ -204,6 +206,29 @@ async def _safe_edit(edit_coro) -> None:
             log.warning("Не удалось отредактировать сообщение: %s", exc)
     except TelegramError:
         log.exception("Ошибка Telegram при редактировании сообщения")
+
+
+async def send_screenshot(message, result: Optional[SearchResult]) -> None:
+    """Присылает картинку страницы с подсвеченным текстом. Сбой не ломает основной ответ."""
+    if message is None or result is None:
+        return
+    try:
+        loc = result.location
+        title = "Страница из Вавилонской библиотеки"
+        if result.source == "local":
+            title += " (встроенная)"
+        subtitle = f"Стена {loc.wall} · Полка {loc.shelf} · Том {loc.volume} · Страница {loc.page}"
+        photo = await asyncio.to_thread(
+            page_image.render_page,
+            result.page_text,
+            result.match_start,
+            len(result.query),
+            title,
+            subtitle,
+        )
+        await message.reply_photo(photo=photo, caption=f"Найденный текст выделен: {result.query[:150]}")
+    except Exception:
+        log.exception("Не удалось отправить скриншот страницы")
 
 
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str) -> None:
@@ -236,12 +261,13 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_t
         return
 
     status = await msg.reply_text("🔎 Ищу…")
-    text, kb = await do_search(context, v.text, DEFAULT_MODE)
+    text, kb, result = await do_search(context, v.text, DEFAULT_MODE)
     await _safe_edit(
         status.edit_text(
             text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
         )
     )
+    await send_screenshot(msg, result)
 
 
 # ------------------------------------------------------------------- команды
@@ -307,12 +333,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await _safe_edit(q.edit_message_text("🔎 Ищу…"))
-    text, kb = await do_search(context, query, mode, use_cache=use_cache)
+    text, kb, result = await do_search(context, query, mode, use_cache=use_cache)
     await _safe_edit(
         q.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
         )
     )
+    await send_screenshot(q.message, result)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
