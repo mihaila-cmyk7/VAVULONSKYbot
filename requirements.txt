@@ -1,0 +1,4 @@
+python-telegram-bot>=20.7,<22
+httpx>=0.27
+beautifulsoup4>=4.12
+python-dotenv>=1.0
