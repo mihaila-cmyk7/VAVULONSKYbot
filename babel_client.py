@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -17,6 +18,8 @@ from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
+
+import local_library
 
 log = logging.getLogger(__name__)
 
@@ -88,10 +91,12 @@ class SearchResult:
     location: Location
     page_text: str
     match_start: Optional[int]   # индекс найденного текста в page_text или None
+    source: str = "site"         # "site" (libraryofbabel.info) или "local" (встроенная библиотека)
 
     @property
-    def url(self) -> str:
-        return self.location.url
+    def url(self) -> Optional[str]:
+        """Ссылка на страницу на сайте; для локального результата её не существует."""
+        return self.location.url if self.source == "site" else None
 
 
 @dataclass
@@ -138,6 +143,9 @@ class BabelClient:
         self._cache_ttl = cache_ttl
         self._form: Optional[FormSpec] = None
         self._form_ts = 0.0
+        # BABEL_SOURCE: auto (сайт, при сбое локально) | site (только сайт) | local (только локально)
+        self.source_mode = os.getenv("BABEL_SOURCE", "auto").strip().lower()
+        self._site_down_until = 0.0
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -225,6 +233,29 @@ class BabelClient:
                 self._cache.move_to_end(key)
                 return hit[1]
 
+        result: Optional[SearchResult] = None
+        site_allowed = self.source_mode != "local" and (
+            self.source_mode == "site" or time.monotonic() >= self._site_down_until
+        )
+        if site_allowed:
+            try:
+                result = await self._search_site(query, mode)
+            except BabelError as exc:
+                if self.source_mode == "site":
+                    raise
+                # Не ждём таймауты на каждом запросе: 5 минут сразу идём в локальную библиотеку.
+                self._site_down_until = time.monotonic() + 300
+                log.warning("Сайт не ответил (%r), перехожу на локальную библиотеку на 5 минут", exc)
+        if result is None:
+            result = self._search_local(query, mode, fresh=not use_cache)
+
+        self._cache[key] = (time.monotonic(), result)
+        self._cache.move_to_end(key)
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        return result
+
+    async def _search_site(self, query: str, mode: str) -> SearchResult:
         spec = await self._get_form()
         data = {spec.text_field: query, **spec.extra}
         if spec.mode_field:
@@ -234,13 +265,19 @@ class BabelClient:
             resp = await self._request("GET", url, params=data)
         else:
             resp = await self._request("POST", url, data=data)
+        return self._parse_result(resp.text, str(resp.url), query, mode)
 
-        result = self._parse_result(resp.text, str(resp.url), query, mode)
-        self._cache[key] = (time.monotonic(), result)
-        self._cache.move_to_end(key)
-        while len(self._cache) > self._cache_size:
-            self._cache.popitem(last=False)
-        return result
+    @staticmethod
+    def _search_local(query: str, mode: str, fresh: bool = False) -> SearchResult:
+        loc, page, start = local_library.search(query, mode, fresh=fresh)
+        return SearchResult(
+            query=query,
+            mode=mode,
+            location=Location(loc.hexagon, str(loc.wall), str(loc.shelf), str(loc.volume), str(loc.page)),
+            page_text=page,
+            match_start=start,
+            source="local",
+        )
 
     # ------------------------------------------------------------- разбор
     @staticmethod

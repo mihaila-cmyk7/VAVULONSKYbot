@@ -127,38 +127,65 @@ def make_snippet(text: str, start: Optional[int], length: int) -> str:
     )
 
 
+MAX_BUTTON_URL = 2000   # Telegram отклоняет слишком длинные ссылки в кнопках
+MAX_MESSAGE = 4000      # лимит Telegram 4096
+
+
+def _short_hex(hexagon: str, keep: int = 24) -> str:
+    """Имя гексагона на сайте длиной около 3000 символов: показываем только края."""
+    if len(hexagon) <= keep * 2 + 3:
+        return hexagon
+    return f"{hexagon[:keep]}…{hexagon[-keep:]} ({len(hexagon)} симв.)"
+
+
 def format_result(result: SearchResult) -> str:
     loc = result.location
     q = result.query
     q_shown = q if len(q) <= QUERY_PREVIEW_LEN else q[:QUERY_PREVIEW_LEN] + "…"
-    snippet = make_snippet(result.page_text, result.match_start, len(result.query))
+    page_text = result.page_text.rstrip() if result.mode == MODE_EXACT else result.page_text
+    snippet = make_snippet(page_text, result.match_start, len(result.query))
     note = ""
     if result.match_start is None:
         note = "\n<i>Точное место текста на странице определить не удалось, показано начало страницы.</i>"
-    url = escape(result.url, quote=True)
-    return (
+
+    if result.source == "local":
+        link = (
+            "ℹ️ <i>Сайт libraryofbabel.info сейчас не отвечает, поэтому текст найден во "
+            "встроенной локальной библиотеке с теми же правилами. Адрес рабочий внутри бота, "
+            "но на сайте такой страницы по этому адресу не будет.</i>"
+        )
+    else:
+        raw_url = result.url or ""
+        if raw_url and len(raw_url) <= MAX_BUTTON_URL:
+            url = escape(raw_url, quote=True)
+            link = f'🔗 <a href="{url}">{url}</a>'
+        else:
+            link = "🔗 Ссылка на сайте слишком длинная для Telegram: откройте страницу через поиск на сайте."
+
+    text = (
         f"🔎 Запрос: {_h(q_shown)}\n"
         f"Режим: {MODE_TITLES.get(result.mode, result.mode)}\n\n"
         "📍 Расположение:\n"
-        f"Гексагон: {_h(loc.hexagon)}\n"
+        f"Гексагон: {_h(_short_hex(loc.hexagon))}\n"
         f"Стена: {_h(loc.wall)}\n"
         f"Полка: {_h(loc.shelf)}\n"
         f"Том: {_h(loc.volume)}\n"
         f"Страница: {_h(loc.page)}\n\n"
         f"📖 {snippet}{note}\n\n"
-        f'🔗 <a href="{url}">{url}</a>'
+        f"{link}"
     )
+    return text[:MAX_MESSAGE] if len(text) > MAX_MESSAGE else text
 
 
-def result_keyboard(url: str, token: str, mode: str) -> InlineKeyboardMarkup:
+def result_keyboard(url: Optional[str], token: str, mode: str) -> InlineKeyboardMarkup:
     if mode == MODE_EXACT:
         toggle = InlineKeyboardButton("Искать внутри страницы", callback_data=f"m:{token}:{MODE_ANY}")
     else:
         toggle = InlineKeyboardButton("Искать как точное совпадение", callback_data=f"m:{token}:{MODE_EXACT}")
-    rows = [
-        [InlineKeyboardButton("Открыть на сайте", url=url)],
-        [toggle],
-    ]
+    rows = []
+    if url and len(url) <= MAX_BUTTON_URL:
+        rows.append([InlineKeyboardButton("Открыть на сайте", url=url)])
+    rows.append([toggle])
     if mode == MODE_ANY:
         # В режиме «внутри страницы» расположение может отличаться от запуска к запуску.
         rows.append([InlineKeyboardButton("Ещё один результат", callback_data=f"r:{token}")])
