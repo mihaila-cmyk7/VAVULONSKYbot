@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import time
@@ -318,7 +319,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Необработанная ошибка", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(fmt.generic_error())
+            await update.effective_message.reply_text(
+                fmt.generic_error() + _debug_text(context.error)
+            )
         except TelegramError:
             pass
 

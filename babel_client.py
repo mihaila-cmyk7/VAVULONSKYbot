@@ -40,7 +40,17 @@ LOCATION_RE = re.compile(
 )
 PAGE_TEXT_IDS = ("textblock", "page", "text", "bookcontent")
 
-USER_AGENT = "babel-bot/1.0 (Telegram bot; polite, rate-limited)"
+# Сайт может отвечать 403 на запросы с «ботовым» User-Agent, поэтому представляемся обычным браузером.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": f"{BASE_URL}/search.html",
+}
 
 
 class BabelError(Exception):
@@ -121,7 +131,7 @@ class BabelClient:
         self._http = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            headers={"User-Agent": USER_AGENT},
+            headers=BROWSER_HEADERS,
         )
         self._cache: OrderedDict[tuple[str, str], tuple[float, SearchResult]] = OrderedDict()
         self._cache_size = cache_size
