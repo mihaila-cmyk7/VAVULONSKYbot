@@ -10,6 +10,7 @@ from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -95,14 +96,60 @@ class TokenStore:
         return self._data.get(token)
 
 
+async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Отвечает 200 OK на любой HTTP-запрос (для проверки Render и внешнего пинга)."""
+    try:
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+    except Exception:
+        pass
+    body = b"ok"
+    try:
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+        )
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+
+async def _keep_alive(url: str, interval: float = 600.0) -> None:
+    """Раз в 10 минут обращается к собственному адресу, чтобы бесплатный сервис не засыпал."""
+    async with httpx.AsyncClient(timeout=20) as http:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await http.get(url)
+            except Exception as exc:
+                log.warning("Самопинг не удался: %r", exc)
+
+
 async def post_init(app: Application) -> None:
     app.bot_data["client"] = BabelClient()
     app.bot_data["tokens"] = TokenStore()
     app.bot_data["limiter"] = RateLimiter(RATE_LIMIT_SECONDS)
     app.bot_data["sem"] = asyncio.Semaphore(MAX_PARALLEL_SEARCHES)
 
+    # На Render Web Service нужно слушать порт из переменной PORT, иначе деплой не завершится.
+    port = os.getenv("PORT")
+    if port:
+        server = await asyncio.start_server(_health_handler, "0.0.0.0", int(port))
+        app.bot_data["health_server"] = server
+        log.info("Health-сервер слушает порт %s", port)
+        ext_url = os.getenv("RENDER_EXTERNAL_URL")
+        if ext_url:
+            app.bot_data["keep_alive_task"] = asyncio.create_task(_keep_alive(ext_url))
+
 
 async def post_shutdown(app: Application) -> None:
+    task = app.bot_data.get("keep_alive_task")
+    if task:
+        task.cancel()
+    server = app.bot_data.get("health_server")
+    if server:
+        server.close()
     client: BabelClient = app.bot_data.get("client")
     if client:
         await client.aclose()
