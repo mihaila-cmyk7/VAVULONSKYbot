@@ -31,6 +31,7 @@ GOOGLE_URL = "https://clients5.google.com/translate_a/t"
 GOOGLE_SINGLE_URL = "https://translate.googleapis.com/translate_a/single"
 MYMEMORY_URL = "https://api.mymemory.translated.net/get"
 YANDEX_URL = "https://translate.yandex.net/api/v1.5/tr.json/translate"
+YANDEX_CLOUD_URL = "https://translate.api.cloud.yandex.net/translate/v2/translate"
 
 # Лимит запроса в библиотеке; больше переводить нет смысла.
 MAX_INPUT = 3200
@@ -107,11 +108,22 @@ def _check_response(resp: object, title: str) -> None:
         raise TranslationError(f"{title}: HTTP {status}")
 
 
-def _looks_mangled(source: str, translated: str) -> bool:
-    """Отсекает «перевод», который на самом деле транслитерация или мусор.
+def _looks_broken(translated: str) -> bool:
+    """Ответ, который не является английским текстом, — ошибка любого сервиса."""
+    return (
+        not translated.strip()
+        or not _LATIN_RE.search(translated)
+        or bool(_CYRILLIC_RE.search(translated))
+    )
 
-    MyMemory иногда отвечает «r te6r» вместо «I love you». Такое нельзя ни
-    показывать, ни искать: пользователь просил перевод, а не искажённые слова.
+
+def _looks_mangled(source: str, translated: str) -> bool:
+    """Строгая проверка для MyMemory: он иногда выдаёт транслитерацию или мусор.
+
+    Например, «я тебя люблю» -> «r te6r» вместо «I love you». Google и Яндекс
+    так не ошибаются, поэтому к ним эта проверка не применяется: иначе она
+    отбрасывает нормальные английские формы имён и заимствований («Иван» ->
+    «Ivan», «суши» -> «sushi»).
     """
     if _CYRILLIC_RE.search(translated):
         return True
@@ -204,7 +216,13 @@ class Translator:
             if not translated:
                 errors.append(f"{name}: пустой ответ")
                 continue
-            if _looks_mangled(text, translated):
+            if _looks_broken(translated):
+                errors.append(f"{name}: ответ не на английском")
+                log.warning("Перевод через %s отброшен: %r", name, translated[:100])
+                continue
+            # Google и Яндекс переводят надёжно; строгая проверка нужна только
+            # для MyMemory, который иногда выдаёт транслитерацию вместо перевода.
+            if name == "mymemory" and _looks_mangled(text, translated):
                 errors.append(f"{name}: ответ похож на транслитерацию или мусор")
                 log.warning("Перевод через %s отброшен: %r", name, translated[:100])
                 continue
@@ -272,6 +290,34 @@ class Translator:
     async def _yandex(self, text: str) -> str:
         if not self.yandex_key:
             raise TranslationError("не задан YANDEX_TRANSLATE_KEY")
+        # Ключи Яндекс.Облака начинаются с AQVN и работают только с API v2;
+        # старые ключи вида trnsl.1.1... — с API v1.5.
+        if self.yandex_key.startswith("trnsl."):
+            return await self._yandex_legacy(text)
+        return await self._yandex_cloud(text)
+
+    async def _yandex_cloud(self, text: str) -> str:
+        resp = await self._http.post(
+            YANDEX_CLOUD_URL,
+            headers={"Authorization": f"Api-Key {self.yandex_key}"},
+            json={
+                "sourceLanguageCode": "ru",
+                "targetLanguageCode": "en",
+                "texts": [text],
+            },
+        )
+        _check_response(resp, "Яндекс")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise TranslationError("Яндекс вернул не JSON") from exc
+        translations = data.get("translations") or []
+        out = "".join(str(item.get("text") or "") for item in translations)
+        if not out.strip():
+            raise TranslationError("Яндекс вернул пустой перевод")
+        return out
+
+    async def _yandex_legacy(self, text: str) -> str:
         resp = await self._http.post(
             YANDEX_URL,
             params={"key": self.yandex_key, "lang": "ru-en", "format": "plain"},
