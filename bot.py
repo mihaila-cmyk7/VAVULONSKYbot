@@ -155,6 +155,20 @@ async def post_shutdown(app: Application) -> None:
         await client.aclose()
 
 
+# Если задать переменную окружения DEBUG_ERRORS=1, бот допишет причину ошибки прямо в чат.
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS") == "1"
+
+
+def _debug_text(exc: object) -> str:
+    if not DEBUG_ERRORS:
+        return ""
+    return f"\n\n[debug] {type(exc).__name__}: {str(exc)[:400]}"
+
+
+def _debug_html(exc: object) -> str:
+    return html.escape(_debug_text(exc), quote=False)
+
+
 # ------------------------------------------------------------------ ядро поиска
 async def do_search(
     context: ContextTypes.DEFAULT_TYPE, query: str, mode: str, use_cache: bool = True
@@ -164,18 +178,18 @@ async def do_search(
     try:
         async with bd["sem"]:
             result = await bd["client"].search(query, mode, use_cache=use_cache)
-    except BabelUnavailable:
+    except BabelUnavailable as exc:
         log.exception("Сайт недоступен")
-        return fmt.site_unavailable(), None
-    except BabelParseError:
+        return fmt.site_unavailable() + _debug_html(exc), None
+    except BabelParseError as exc:
         log.exception("Не удалось разобрать ответ сайта (запрос=%r, режим=%s)", query[:80], mode)
-        return fmt.parse_error(), None
-    except BabelError:
+        return fmt.parse_error() + _debug_html(exc), None
+    except BabelError as exc:
         log.exception("Ошибка клиента")
-        return fmt.generic_error(), None
-    except Exception:
+        return fmt.generic_error() + _debug_html(exc), None
+    except Exception as exc:
         log.exception("Неожиданная ошибка поиска")
-        return fmt.generic_error(), None
+        return fmt.generic_error() + _debug_html(exc), None
 
     token = bd["tokens"].put({"query": query, "mode": mode})
     return fmt.format_result(result), fmt.result_keyboard(result.url, token, mode)
